@@ -1,121 +1,186 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+import time
+from collections import deque
 
-# MediaPipe setup
+# ================= CONFIG =================
+WIDTH, HEIGHT = 1280, 720
+TOOLBAR_HEIGHT = 100
+MAX_POINTS = 8
+
+COLORS = [
+    (255, 0, 255),   # Purple
+    (255, 0, 0),     # Blue
+    (0, 255, 0),     # Green
+    (0, 255, 255),   # Yellow
+    (0, 0, 0)        # Eraser
+]
+
+# ================= HAND SETUP =================
 mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
-
 hands = mp_hands.Hands(
     max_num_hands=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7
+    min_detection_confidence=0.8,
+    min_tracking_confidence=0.8
 )
 
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-
-cap.set(3, 1280)
-cap.set(4, 720)
-
-canvas = None
-prev_x, prev_y = 0, 0
-
-brush_color = (255, 0, 255)
-brush_thickness = 8
-
+mp_draw = mp.solutions.drawing_utils
 tip_ids = [4, 8, 12, 16, 20]
 
-while True:
-    success, frame = cap.read()
-    if not success:
-        break
+# ================= MAIN =================
+def main():
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap.set(3, WIDTH)
+    cap.set(4, HEIGHT)
 
-    frame = cv2.flip(frame, 1)
-    h, w, _ = frame.shape
+    canvas = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
 
-    if canvas is None:
-        canvas = np.zeros_like(frame)
+    brush_color = COLORS[0]
+    brush_thickness = 10
 
-    # Draw top toolbar
-    cv2.rectangle(frame, (0, 0), (w, 100), (50, 50, 50), -1)
+    points = deque(maxlen=MAX_POINTS)
 
-    # Color buttons
-    colors = [(255, 0, 255), (255, 0, 0), (0, 255, 0), (0, 255, 255), (0, 0, 0)]
-    for i, color in enumerate(colors):
-        cv2.circle(frame, (100 + i * 100, 50), 30, color, -1)
+    prev_time = 0
+    last_clear_time = 0
+    CLEAR_COOLDOWN = 1.5
 
-    cv2.putText(frame, "CLEAR", (650, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-    cv2.putText(frame, "SAVE", (850, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb)
+        frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
 
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb)
 
-            landmarks = hand_landmarks.landmark
+        # ===== Toolbar =====
+        cv2.rectangle(frame, (0, 0), (w, TOOLBAR_HEIGHT), (30, 30, 30), -1)
 
-            x = int(landmarks[8].x * w)
-            y = int(landmarks[8].y * h)
+        # Color buttons
+        for i, color in enumerate(COLORS):
+            cx = 100 + i * 100
+            cv2.circle(frame, (cx, 50), 30, color, -1)
 
-            fingers = []
+        # CLEAR Button
+        cv2.rectangle(frame, (900, 20), (1050, 80), (80, 80, 80), -1)
+        cv2.putText(frame, "CLEAR", (915, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    (255, 255, 255), 2)
 
-            # Thumb
-            fingers.append(1 if landmarks[4].x > landmarks[3].x else 0)
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
 
-            # Other fingers
-            for i in range(1, 5):
-                fingers.append(1 if landmarks[tip_ids[i]].y < landmarks[tip_ids[i]-2].y else 0)
+                lm = hand_landmarks.landmark
+                fingers = []
 
-            # 🎨 SELECTION MODE (Index + Middle up)
-            if fingers[1] == 1 and fingers[2] == 1:
+                # Thumb
+                fingers.append(1 if lm[4].x > lm[3].x else 0)
 
-                prev_x, prev_y = 0, 0
+                # Other fingers
+                for i in range(1, 5):
+                    fingers.append(
+                        1 if lm[tip_ids[i]].y <
+                        lm[tip_ids[i] - 2].y else 0
+                    )
 
-                # Color selection
-                for i in range(len(colors)):
-                    cx = 100 + i * 100
-                    if abs(x - cx) < 40 and y < 100:
-                        brush_color = colors[i]
+                x = int(lm[8].x * w)
+                y = int(lm[8].y * h)
 
-                # Clear
-                if 600 < x < 750 and y < 100:
-                    canvas = np.zeros_like(frame)
+                # ===== Pinch → Brush Size Control =====
+                x1 = int(lm[4].x * w)
+                y1 = int(lm[4].y * h)
+                distance = np.hypot(x - x1, y - y1)
 
-                # Save
-                if 800 < x < 950 and y < 100:
-                    cv2.imwrite("air_paint.png", canvas)
-                    print("Image Saved!")
+                if fingers[0] and fingers[1] and sum(fingers) == 2:
+                    brush_thickness = int(np.interp(distance, [20, 200], [5, 50]))
+                    cv2.line(frame, (x, y), (x1, y1), (255, 255, 255), 2)
 
-            # ✍ DRAW MODE (Only index up)
-            elif fingers[1] == 1 and sum(fingers) == 1:
+                # ===== Draw Mode =====
+                elif fingers[1] and sum(fingers) == 1:
+                    points.append((x, y))
 
-                if prev_x == 0 and prev_y == 0:
-                    prev_x, prev_y = x, y
+                    avg_x = int(np.mean([p[0] for p in points]))
+                    avg_y = int(np.mean([p[1] for p in points]))
 
-                cv2.line(canvas, (prev_x, prev_y), (x, y), brush_color, brush_thickness)
-                prev_x, prev_y = x, y
+                    cv2.circle(frame, (avg_x, avg_y),
+                               brush_thickness // 2,
+                               brush_color, -1)
 
-            else:
-                prev_x, prev_y = 0, 0
+                    if len(points) > 1:
+                        cv2.line(canvas,
+                                 points[-2],
+                                 points[-1],
+                                 brush_color,
+                                 brush_thickness)
 
-            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                else:
+                    points.clear()
 
-    combined = cv2.add(frame, canvas)
+                # ===== Selection Mode (Index + Middle) =====
+                if fingers[1] and fingers[2]:
+                    for i in range(len(COLORS)):
+                        cx = 100 + i * 100
+                        if abs(x - cx) < 40 and y < TOOLBAR_HEIGHT:
+                            brush_color = COLORS[i]
 
-    cv2.imshow("Air Paint Pro", combined)
+                    # Click CLEAR button
+                    if 900 < x < 1050 and 20 < y < 80:
+                        current_time = time.time()
+                        if current_time - last_clear_time > CLEAR_COOLDOWN:
+                            canvas = np.zeros_like(canvas)
+                            last_clear_time = current_time
+                            print("🗑 Canvas Cleared")
 
-    key = cv2.waitKey(1)
+                # ===== Open Palm Clear (All fingers up) =====
+                if sum(fingers) == 5:
+                    current_time = time.time()
+                    if current_time - last_clear_time > CLEAR_COOLDOWN:
+                        canvas = np.zeros_like(canvas)
+                        last_clear_time = current_time
+                        print("🖐 Open Palm Clear")
 
-    if key == ord('q'):
-        break
+                mp_draw.draw_landmarks(frame,
+                                       hand_landmarks,
+                                       mp_hands.HAND_CONNECTIONS)
 
-    if key == ord('+'):
-        brush_thickness += 2
+        # ===== Blend Canvas =====
+        gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
+        mask_inv = cv2.bitwise_not(mask)
 
-    if key == ord('-'):
-        brush_thickness = max(2, brush_thickness - 2)
+        frame_bg = cv2.bitwise_and(frame, frame, mask=mask_inv)
+        canvas_fg = cv2.bitwise_and(canvas, canvas, mask=mask)
 
-cap.release()
-cv2.destroyAllWindows()
-hands.close()
+        final = cv2.add(frame_bg, canvas_fg)
+
+        # ===== FPS =====
+        curr_time = time.time()
+        fps = 1 / (curr_time - prev_time) if prev_time else 0
+        prev_time = curr_time
+
+        cv2.putText(final, f"FPS: {int(fps)}",
+                    (20, 680),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1, (0, 255, 0), 2)
+
+        cv2.putText(final, f"Brush: {brush_thickness}",
+                    (1050, 680),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1, (0, 255, 255), 2)
+
+        cv2.imshow("Air Paint Pro v2", final)
+
+        key = cv2.waitKey(1)
+        if key == ord('q'):
+            break
+        if key == ord('c'):
+            canvas = np.zeros_like(canvas)
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
